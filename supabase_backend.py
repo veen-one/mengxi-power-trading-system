@@ -5,8 +5,8 @@ import pandas as pd
 import streamlit as st
 from supabase import create_client
 
-# Project URL is public metadata. Credentials are read only from Streamlit Secrets/env.
 DEFAULT_SUPABASE_URL = "https://bwhpatzqcklgyzuifvhu.supabase.co"
+DEFAULT_SUPABASE_KEY = "sb_publishable_Fku7LhdmxMEaTtLlULxylg_VySeg839"
 
 
 def _secret(name: str, default=None):
@@ -19,11 +19,7 @@ def _secret(name: str, default=None):
 @st.cache_resource
 def get_supabase():
     url = _secret("SUPABASE_URL", DEFAULT_SUPABASE_URL)
-    key = _secret("SUPABASE_KEY")
-    if not key:
-        raise RuntimeError(
-            "未配置 SUPABASE_KEY。请在 .streamlit/secrets.toml 或部署平台 Secrets 中配置，切勿提交到 GitHub。"
-        )
+    key = _secret("SUPABASE_KEY", DEFAULT_SUPABASE_KEY)
     return create_client(url, key)
 
 
