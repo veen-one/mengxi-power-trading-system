@@ -16,7 +16,7 @@ from supabase_backend import (
 APP_TITLE = "蒙西新能源多场站日清分与交易决策系统"
 st.set_page_config(page_title=APP_TITLE, page_icon="⚡", layout="wide")
 
-RULE_VERSION = "蒙西2026（自动结算V2.2）"
+RULE_VERSION = "蒙西2026（自动结算V2.3）"
 BASELINE_PRICE = 282.9
 MONTH_LOWER = 0.90
 MONTH_UPPER = 1.10
@@ -169,12 +169,6 @@ def auto_settlement(sm, inp):
     if not sm:
         return {}
     lt, act, p_lt, p_spot, energy = sm["lt"], sm["actual"], sm["lt_price"], sm["spot_price"], sm["energy"]
-
-    # 用户确认的价格映射：
-    # P_LT = 本站中长期均价
-    # P_统一 = 现货均价
-    # P_节点 = 现货均价
-    # P_区域同类型 = 本站中长期均价
     p_unified = p_spot
     p_node = p_spot
     p_regional = p_lt
@@ -240,7 +234,7 @@ except Exception as exc:
     DB_OK, DB_ERROR = False, str(exc)
 
 st.sidebar.title("⚡ 蒙西交易系统")
-st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.2")
+st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.3")
 if DB_OK:
     st.sidebar.success("数据库已连接")
 else:
@@ -366,25 +360,14 @@ elif page == "月度累计":
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 elif page == "自动结算":
-    st.title("自动结算｜考核、风险防范、绿电、机制")
-    st.caption("考核基准：Qactual先扣机制电量。价格参数自动取本站数据，不再手填P区域同类型。")
+    st.title("自动结算｜月度结算表")
+    st.caption("自动结算改为表格展示：基准电量、价格参数、考核、风险防范、机制、绿电和最终收益集中在一张结算表中。")
     row, _ = station_selector("settle_station")
     if row is None: st.stop()
     month = st.text_input("月份 YYYY-MM", date.today().strftime("%Y-%m"), key="settle_month")
     sm = month_summary(month_daily(int(row.id), month))
     if not sm: st.info("该月暂无日清分"); st.stop()
     old = load_month_input(int(row.id), month)
-    me_old = max(0.0, float(old.get("mechanism_energy") or 0.0)); assess_base_old = max(0.0, sm["actual"] - me_old); assess_cov_old = sm["lt"] / assess_base_old if assess_base_old else 0.0
-    c = st.columns(6)
-    c[0].metric("上网电量 Qactual", f"{sm['actual']:,.2f}"); c[1].metric("机制电量", f"{me_old:,.2f}"); c[2].metric("考核基准电量", f"{assess_base_old:,.2f}")
-    c[3].metric("中长期电量", f"{sm['lt']:,.2f}"); c[4].metric("考核签约率", f"{assess_cov_old:.2%}"); c[5].metric("P_LT 本站中长期均价", f"{sm['lt_price']:.2f}")
-
-    st.subheader("考核价格参数（自动）")
-    p = st.columns(4)
-    p[0].metric("P_LT", f"{sm['lt_price']:.2f}", help="本站中长期均价")
-    p[1].metric("P_统一", f"{sm['spot_price']:.2f}", help="取现货均价")
-    p[2].metric("P_节点", f"{sm['spot_price']:.2f}", help="取现货均价")
-    p[3].metric("P_区域同类型", f"{sm['lt_price']:.2f}", help="按确认口径，直接取本站中长期均价")
 
     with st.expander("月度公共参数", expanded=not bool(old)):
         with st.form("market_inputs"):
@@ -405,18 +388,52 @@ elif page == "自动结算":
                 save_month_input(int(row.id), month, {"market_bilateral_listing_avg": marketavg, "curve_reasonability": curve, "congestion": congestion, "pre_risk_other_fee": pre_other, "regular_fee": regular, "green_contract_energy": ge, "green_user_actual_energy": gu, "green_environment_price": gp, "mechanism_energy": me, "mechanism_price": mp, "mechanism_spot_price": ms, "unit_fee": unit, "manual_adjustment": manual})
                 st.success("已保存并重算"); st.rerun()
 
-    calc = auto_settlement(sm, load_month_input(int(row.id), month))
-    st.subheader("考核基准")
-    c = st.columns(4)
-    c[0].metric("Qactual - 机制电量", f"{calc.get('assessment_actual', 0):,.2f} MWh"); c[1].metric("90%下限电量", f"{calc.get('assessment_lower_energy', 0):,.2f} MWh")
-    c[2].metric("110%上限电量", f"{calc.get('assessment_upper_energy', 0):,.2f} MWh"); c[3].metric("考核签约率", f"{calc.get('assessment_coverage', 0):.2%}")
-    st.subheader("自动计算结果")
-    c = st.columns(5)
-    c[0].metric("全月上限考核", money(calc.get("upper_assessment"))); c[1].metric("全月下限考核", money(calc.get("lower_assessment"))); c[2].metric("自动考核", money(calc.get("assessment")))
-    c[3].metric("风险防范", money(calc.get("risk_prevention")) if calc.get("risk_ready") else "待公共参数"); c[4].metric("预计最终收益", money(calc.get("final_revenue")))
-    c = st.columns(4)
-    c[0].metric("绿电费用", money(calc.get("green_fee"))); c[1].metric("机制费用", money(calc.get("mechanism_fee"))); c[2].metric("最终结算均价", f"{calc.get('final_price', 0):.2f}"); c[3].metric("风险防范前收入", money(calc.get("pre_risk_revenue")))
-    st.info("当前价格映射：P_LT=本站中长期均价；P_统一=现货均价；P_节点=现货均价；P_区域同类型=本站中长期均价。")
+    inp = load_month_input(int(row.id), month)
+    calc = auto_settlement(sm, inp)
+    me = max(0.0, float(inp.get("mechanism_energy") or 0.0))
+
+    st.subheader(f"{row['name']}｜{month} 自动结算表")
+    settle_rows = [
+        ["基础数据", "实际上网电量 Qactual", "日清分月累计", sm["actual"], "MWh", "自动"],
+        ["基础数据", "机制电量 Q机制", "月度机制参数", me, "MWh", "已录入" if me > 0 else "未录入/0"],
+        ["考核基准", "扣机制后考核电量", "Qactual - Q机制", calc.get("assessment_actual", 0), "MWh", "自动"],
+        ["考核基准", "90%下限电量", "(Qactual-Q机制)×90%", calc.get("assessment_lower_energy", 0), "MWh", "自动"],
+        ["考核基准", "110%上限电量", "(Qactual-Q机制)×110%", calc.get("assessment_upper_energy", 0), "MWh", "自动"],
+        ["考核基准", "中长期电量 QLT", "日清分月累计", sm["lt"], "MWh", "自动"],
+        ["考核基准", "考核签约率", "QLT/(Qactual-Q机制)", calc.get("assessment_coverage", 0) * 100, "%", "自动"],
+        ["价格参数", "P_LT", "本站中长期均价", calc.get("p_lt", 0), "元/MWh", "自动"],
+        ["价格参数", "P_统一", "取现货均价", calc.get("p_unified", 0), "元/MWh", "自动"],
+        ["价格参数", "P_节点", "取现货均价", calc.get("p_node", 0), "元/MWh", "自动"],
+        ["价格参数", "P_区域同类型", "取本站中长期均价", calc.get("p_regional", 0), "元/MWh", "自动"],
+        ["考核费用", "全月上限考核", "[QLT-(Qactual-Q机制)×110%]×(1.1P_LT-P_统一)", calc.get("upper_assessment", 0), "元", "自动"],
+        ["考核费用", "全月下限考核", "[(Qactual-Q机制)×90%-QLT]×(1.3P_节点-P_区域同类型)", calc.get("lower_assessment", 0), "元", "自动"],
+        ["考核费用", "自动考核合计", "max(上限考核, 下限考核)", calc.get("assessment", 0), "元", "自动"],
+        ["电能结算", "电能量收入", "日清分电能量合计月累计", sm["energy"], "元", "自动"],
+        ["风险防范", "风险防范前收入", "电能量收入+阻塞盈余+其他净额-考核", calc.get("pre_risk_revenue", 0), "元", "自动"],
+        ["风险防范", "风险防范金额", "按风险防范参数计算", calc.get("risk_prevention", 0), "元", "自动" if calc.get("risk_ready") else "待公共参数"],
+        ["其他结算", "绿电费用", "绿电结算", calc.get("green_fee", 0), "元", "自动/参数"],
+        ["其他结算", "机制费用", "Q机制×(P机制-P机制现货)", calc.get("mechanism_fee", 0), "元", "自动/参数"],
+        ["最终结果", "预计最终收益", "电能量±各项结算费用", calc.get("final_revenue", 0), "元", "自动"],
+        ["最终结果", "最终结算均价", "预计最终收益/Qactual", calc.get("final_price", 0), "元/MWh", "自动"],
+    ]
+    settle_df = pd.DataFrame(settle_rows, columns=["类别", "结算项目", "计算口径/公式", "结果", "单位", "状态"])
+    settle_df["结果"] = pd.to_numeric(settle_df["结果"], errors="coerce").round(4)
+    st.dataframe(settle_df, use_container_width=True, hide_index=True, height=770)
+
+    st.subheader("费用汇总")
+    fee_df = pd.DataFrame([
+        ["电能量收入", sm["energy"]],
+        ["上限考核", -float(calc.get("upper_assessment", 0))],
+        ["下限考核", -float(calc.get("lower_assessment", 0))],
+        ["实际计入考核", -float(calc.get("assessment", 0))],
+        ["风险防范", float(calc.get("risk_prevention", 0))],
+        ["绿电费用", float(calc.get("green_fee", 0))],
+        ["机制费用", float(calc.get("mechanism_fee", 0))],
+        ["预计最终收益", float(calc.get("final_revenue", 0))],
+    ], columns=["项目", "金额（元）"])
+    fee_df["金额（元）"] = fee_df["金额（元）"].round(2)
+    st.dataframe(fee_df, use_container_width=True, hide_index=True)
+    st.caption("价格映射：P_LT=本站中长期均价；P_统一=P_节点=现货均价；P_区域同类型=本站中长期均价。")
 
 elif page == "交易决策":
     st.title("月内交易决策")
@@ -457,6 +474,7 @@ elif page == "系统状态":
         st.write("规则版本：", RULE_VERSION)
         st.write("考核电量口径：Qactual - 机制电量 后再乘90%/110%")
         st.write("考核价格口径：P_LT=本站中长期均价；P_统一=P_节点=现货均价；P_区域同类型=本站中长期均价")
+        st.write("自动结算展示：月度结算表 + 费用汇总表")
         st.write("核心表：stations / daily_summary / hourly_detail / monthly_settlement")
     else:
         st.error(DB_ERROR)
