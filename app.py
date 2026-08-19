@@ -9,14 +9,23 @@ import streamlit as st
 from openpyxl import load_workbook
 
 from supabase_backend import (
-    all_daily, create_station, daily_rows, delete_daily, get_supabase, healthcheck,
-    hourly_rows, month_daily, save_daily, stations, update_station,
+    all_daily,
+    create_station,
+    daily_rows,
+    delete_daily,
+    get_supabase,
+    healthcheck,
+    hourly_rows,
+    month_daily,
+    save_daily,
+    stations,
+    update_station,
 )
 
 APP_TITLE = "蒙西新能源多场站日清分与交易决策系统"
 st.set_page_config(page_title=APP_TITLE, page_icon="⚡", layout="wide")
 
-RULE_VERSION = "蒙西2026（自动结算V2）"
+RULE_VERSION = "蒙西2026（自动结算V2.1）"
 BASELINE_PRICE = 282.9
 MONTH_LOWER = 0.90
 MONTH_UPPER = 1.10
@@ -98,7 +107,8 @@ def parse_excel(data, filename):
         if score >= 288 and (best is None or score > best[0]):
             best = (score, start)
     if not best:
-        raise ValueError("未识别到96点数据；当前模板要求 C/D/J/K/L 为中长期电力/中长期价/实时价/实际计量/统一结算点价。")
+        raise ValueError("未识别到96点数据；要求 C/D/J/K/L 为中长期电力/中长期价/实时价/实际计量/统一结算点价。")
+
     start = best[1]
     raw = pd.DataFrame([
         {
@@ -110,6 +120,7 @@ def parse_excel(data, filename):
         }
         for r in range(start, start + 96)
     ])
+
     rows = []
     for h in range(24):
         g = raw.iloc[h * 4:(h + 1) * 4]
@@ -121,9 +132,10 @@ def parse_excel(data, filename):
         sf = ae * sp
         lf = le * (lp - up)
         rows.append([h + 1, le, lp, ae, sp, up, sf, lf, sf + lf])
+
     hourly = pd.DataFrame(rows, columns=[
         "时点", "中长期电量", "中长期价", "上网电量", "实时价", "统一结算点价",
-        "现货电费", "中长期差价电费", "电能量合计"
+        "现货电费", "中长期差价电费", "电能量合计",
     ])
     summary = {
         "trade_date": trade_date,
@@ -149,7 +161,9 @@ def month_summary(df):
         x[c] = pd.to_numeric(x[c], errors="coerce").fillna(0.0)
     lt, act = float(x.lt_energy.sum()), float(x.actual_energy.sum())
     return {
-        "lt": lt, "actual": act, "coverage": lt / act if act else 0.0,
+        "lt": lt,
+        "actual": act,
+        "coverage": lt / act if act else 0.0,
         "lt_price": wavg(x.lt_price, x.lt_energy),
         "spot_price": wavg(x.spot_price, x.actual_energy),
         "unified_price": wavg(x.unified_price, x.lt_energy),
@@ -167,7 +181,10 @@ def station_selector(key, active=True):
 
 
 def load_month_input(station_id, month):
-    data = get_supabase().table("monthly_settlement").select("*").eq("station_id", station_id).eq("trade_month", month).limit(1).execute().data or []
+    data = (
+        get_supabase().table("monthly_settlement").select("*")
+        .eq("station_id", station_id).eq("trade_month", month).limit(1).execute().data or []
+    )
     return data[0] if data else {}
 
 
@@ -177,15 +194,40 @@ def save_month_input(station_id, month, payload):
 
 
 def auto_settlement(sm, inp):
+    """月度自动结算。
+
+    考核基准电量按用户确认口径：Q_assess = max(Q_actual - Q_mechanism, 0)。
+    签约率、90%下限与110%上限均基于 Q_assess 计算。
+    """
     if not sm:
         return {}
-    lt, act, lp, sp, up, energy = sm["lt"], sm["actual"], sm["lt_price"], sm["spot_price"], sm["unified_price"], sm["energy"]
-    coverage = sm["coverage"]
-    upper_assess = max(0.0, (lt - act * MONTH_UPPER) * (lp * UPPER_FACTOR - up)) if act > 0 and coverage > MONTH_UPPER and lp > up else 0.0
+
+    lt = sm["lt"]
+    act = sm["actual"]
+    lp = sm["lt_price"]
+    sp = sm["spot_price"]
+    up = sm["unified_price"]
+    energy = sm["energy"]
+
+    # 机制电量先从实际电量中扣除，再进入签约比例考核。
+    me = max(0.0, float(inp.get("mechanism_energy") or 0.0))
+    assess_actual = max(0.0, act - me)
+    assess_coverage = lt / assess_actual if assess_actual > 0 else 0.0
+    lower_energy = assess_actual * MONTH_LOWER
+    upper_energy = assess_actual * MONTH_UPPER
+
+    upper_assess = 0.0
+    if assess_actual > 0 and assess_coverage > MONTH_UPPER and lp > up:
+        upper_assess = max(0.0, (lt - upper_energy) * (lp * UPPER_FACTOR - up))
+
     regional_lt = float(inp.get("regional_same_type_lt_price") or 0.0)
     lower_ready = regional_lt > 0
-    lower_assess = max(0.0, (act * MONTH_LOWER - lt) * (sp * LOWER_FACTOR - regional_lt)) if lower_ready and act > 0 and coverage < MONTH_LOWER and sp > regional_lt else 0.0
+    lower_assess = 0.0
+    if lower_ready and assess_actual > 0 and assess_coverage < MONTH_LOWER and sp > regional_lt:
+        lower_assess = max(0.0, (lower_energy - lt) * (sp * LOWER_FACTOR - regional_lt))
+
     assessment = max(upper_assess, lower_assess if lower_ready else 0.0)
+
     market_avg = float(inp.get("market_bilateral_listing_avg") or 0.0)
     curve = float(inp.get("curve_reasonability") or 0.0)
     risk_ready = market_avg > 0 and curve > 0
@@ -194,6 +236,7 @@ def auto_settlement(sm, inp):
     congestion = float(inp.get("congestion") or 0.0)
     pre_other = float(inp.get("pre_risk_other_fee") or 0.0)
     pre_risk = energy + congestion + pre_other - assessment
+
     risk = 0.0
     if risk_ready and market_avg <= BASELINE_PRICE and act > 0 and lp > 0:
         floor, cap = act * lp * comp_ratio, act * lp * rec_ratio
@@ -201,24 +244,38 @@ def auto_settlement(sm, inp):
             risk = floor - pre_risk
         elif pre_risk > cap:
             risk = cap - pre_risk
+
     ge = float(inp.get("green_contract_energy") or 0.0)
     gu = float(inp.get("green_user_actual_energy") or 0.0)
     gp = float(inp.get("green_environment_price") or 0.0)
     green_energy = min(ge, act, gu) if ge > 0 and gu > 0 else 0.0
     green_fee = green_energy * gp
-    me = float(inp.get("mechanism_energy") or 0.0)
+
     mp = float(inp.get("mechanism_price") or BASELINE_PRICE)
     ms = float(inp.get("mechanism_spot_price") or 0.0)
     mechanism_fee = me * (mp - ms) if me > 0 and ms != 0 else 0.0
+
     regular = float(inp.get("regular_fee") or 0.0)
     unit_fee = float(inp.get("unit_fee") or 0.0)
     manual = float(inp.get("manual_adjustment") or 0.0)
     final = energy + congestion - assessment + risk + green_fee + mechanism_fee + regular - unit_fee + manual
+
     return {
-        "upper_assessment": upper_assess, "lower_assessment": lower_assess, "lower_ready": lower_ready,
-        "assessment": assessment, "risk_ready": risk_ready, "risk_prevention": risk,
-        "pre_risk_revenue": pre_risk, "green_fee": green_fee, "mechanism_fee": mechanism_fee,
-        "final_revenue": final, "final_price": final / act if act else 0.0,
+        "assessment_actual": assess_actual,
+        "assessment_coverage": assess_coverage,
+        "assessment_lower_energy": lower_energy,
+        "assessment_upper_energy": upper_energy,
+        "upper_assessment": upper_assess,
+        "lower_assessment": lower_assess,
+        "lower_ready": lower_ready,
+        "assessment": assessment,
+        "risk_ready": risk_ready,
+        "risk_prevention": risk,
+        "pre_risk_revenue": pre_risk,
+        "green_fee": green_fee,
+        "mechanism_fee": mechanism_fee,
+        "final_revenue": final,
+        "final_price": final / act if act else 0.0,
     }
 
 
@@ -229,11 +286,12 @@ except Exception as exc:
     DB_OK, DB_ERROR = False, str(exc)
 
 st.sidebar.title("⚡ 蒙西交易系统")
-st.sidebar.caption("Supabase 云数据库版 · 自动结算V2")
+st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.1")
 if DB_OK:
     st.sidebar.success("数据库已连接")
 else:
     st.sidebar.error("数据库未连接")
+
 page = st.sidebar.radio("导航", ["总览", "场站管理", "日清分上传", "月度累计", "自动结算", "交易决策", "数据管理", "系统状态"])
 if not DB_OK and page != "系统状态":
     st.error("Supabase 未连接，请进入系统状态查看错误。")
@@ -243,7 +301,8 @@ if page == "总览":
     st.title(APP_TITLE)
     sdf, daily = stations(False), all_daily()
     c = st.columns(4)
-    c[0].metric("场站数", len(sdf)); c[1].metric("累计日清分", len(daily))
+    c[0].metric("场站数", len(sdf))
+    c[1].metric("累计日清分", len(daily))
     c[2].metric("累计上网电量", f"{pd.to_numeric(daily.get('actual_energy', pd.Series(dtype=float)), errors='coerce').fillna(0).sum():,.2f} MWh")
     c[3].metric("结算引擎", RULE_VERSION)
     st.info("创建场站 → 批量上传日清分 → 一键全部入库 → 月度累计 → 自动结算 → 交易决策。")
@@ -267,9 +326,14 @@ elif page == "场站管理":
             if not name.strip():
                 st.error("场站名称不能为空")
             else:
-                create_station({"name": name.strip(), "short_name": short.strip() or name.strip(), "station_type": typ, "capacity_mw": cap, "risk_upper": upper, "target_lower": lower, "trade_limit_mwh": limit, "min_spread": spread, "active": True})
+                create_station({
+                    "name": name.strip(), "short_name": short.strip() or name.strip(), "station_type": typ,
+                    "capacity_mw": cap, "risk_upper": upper, "target_lower": lower,
+                    "trade_limit_mwh": limit, "min_spread": spread, "active": True,
+                })
                 st.success("已创建")
                 st.rerun()
+
     sdf = stations(False)
     if not sdf.empty:
         st.dataframe(sdf, use_container_width=True, hide_index=True)
@@ -285,32 +349,26 @@ elif page == "场站管理":
 
 elif page == "日清分上传":
     st.title("日清分批量上传")
-    st.caption("可一次选择一个月多个场站的日清分。系统先自动识别并预览，确认后点一次“一键全部入库”。")
+    st.caption("可一次选择一个月多个场站的日清分。系统先自动识别并预览，再一键全部入库。")
     sdf = stations()
     if sdf.empty:
         st.warning("请先创建场站")
         st.stop()
+
     names = sdf.name.tolist()
     ids = dict(zip(sdf.name, sdf.id))
     files = st.file_uploader("选择多个 Excel 文件", type=["xlsx", "xlsm"], accept_multiple_files=True)
     overwrite = st.checkbox("覆盖数据库中同场站、同日期已有数据", value=False)
 
-    parsed = []
-    preview_rows = []
+    parsed, preview_rows = [], []
     for i, f in enumerate(files or []):
         try:
             data = f.getvalue()
             summary, hourly, start = parse_excel(data, f.name)
             _, auto_name = detect_station(f.name)
-            if auto_name:
-                station_name = auto_name
-                status = "可入库"
-            else:
-                station_name = ""
-                status = "未识别场站"
+            station_name = auto_name or ""
             trade_date = summary.get("trade_date")
-            if not trade_date:
-                status = "未识别日期"
+            status = "可入库" if station_name and trade_date else ("未识别场站" if not station_name else "未识别日期")
             parsed.append({
                 "index": i, "file": f, "data": data, "summary": summary, "hourly": hourly,
                 "station_name": station_name, "trade_date": trade_date, "start": start, "error": None,
@@ -329,15 +387,10 @@ elif page == "日清分上传":
         st.subheader(f"识别预览｜共 {len(preview)} 个文件")
         st.dataframe(preview, use_container_width=True, hide_index=True)
         ready_count = int((preview["状态"] == "可入库").sum())
-        problem_count = len(preview) - ready_count
         a, b, c = st.columns(3)
         a.metric("可直接入库", ready_count)
-        b.metric("需处理", problem_count)
+        b.metric("需处理", len(preview) - ready_count)
         c.metric("总文件数", len(preview))
-
-        unresolved = [x for x in parsed if not x.get("error") and (not x.get("station_name") or not x.get("trade_date"))]
-        if unresolved:
-            st.warning("有文件未识别场站或日期。请先修正场站关键词/文件名后重新上传；一键入库会自动跳过这些文件。")
 
         if st.button("🚀 一键全部入库", type="primary", use_container_width=True):
             success, skipped, failed = [], [], []
@@ -353,10 +406,7 @@ elif page == "日清分上传":
                     try:
                         summary = item["summary"]
                         summary["trade_date"] = item["trade_date"]
-                        save_daily(
-                            int(ids[item["station_name"]]), f.name,
-                            hashlib.md5(item["data"]).hexdigest(), summary, item["hourly"], overwrite,
-                        )
+                        save_daily(int(ids[item["station_name"]]), f.name, hashlib.md5(item["data"]).hexdigest(), summary, item["hourly"], overwrite)
                         success.append(f.name)
                     except ValueError as exc:
                         skipped.append((f.name, str(exc)))
@@ -366,13 +416,9 @@ elif page == "日清分上传":
             progress.empty()
             st.success(f"批量入库完成：成功 {len(success)} 个，跳过 {len(skipped)} 个，失败 {len(failed)} 个。")
             if skipped:
-                with st.expander(f"查看跳过文件（{len(skipped)}）"):
-                    st.dataframe(pd.DataFrame(skipped, columns=["文件", "原因"]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(skipped, columns=["跳过文件", "原因"]), use_container_width=True, hide_index=True)
             if failed:
-                with st.expander(f"查看失败文件（{len(failed)}）"):
-                    st.dataframe(pd.DataFrame(failed, columns=["文件", "错误"]), use_container_width=True, hide_index=True)
-            if success:
-                st.info("成功数据已写入 Supabase，月度累计和自动结算会立即读取这些数据。")
+                st.dataframe(pd.DataFrame(failed, columns=["失败文件", "错误"]), use_container_width=True, hide_index=True)
 
         with st.expander("单文件检查/手动入库"):
             for i, item in enumerate(parsed):
@@ -408,13 +454,18 @@ elif page == "月度累计":
         st.info("暂无数据")
         st.stop()
     c = st.columns(7)
-    c[0].metric("累计上网", f"{sm['actual']:,.2f}"); c[1].metric("累计中长期", f"{sm['lt']:,.2f}"); c[2].metric("仓位", f"{sm['coverage']:.2%}")
-    c[3].metric("中长期均价", f"{sm['lt_price']:.2f}"); c[4].metric("现货均价", f"{sm['spot_price']:.2f}"); c[5].metric("统一结算点均价", f"{sm['unified_price']:.2f}"); c[6].metric("电能量收入", money(sm['energy']))
+    c[0].metric("累计上网", f"{sm['actual']:,.2f}")
+    c[1].metric("累计中长期", f"{sm['lt']:,.2f}")
+    c[2].metric("原始覆盖率", f"{sm['coverage']:.2%}")
+    c[3].metric("中长期均价", f"{sm['lt_price']:.2f}")
+    c[4].metric("现货均价", f"{sm['spot_price']:.2f}")
+    c[5].metric("统一结算点均价", f"{sm['unified_price']:.2f}")
+    c[6].metric("电能量收入", money(sm['energy']))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
 elif page == "自动结算":
     st.title("自动结算｜考核、风险防范、绿电、机制")
-    st.caption("系统按月累计自动计算；只有无法从场站日清分取得的公共参数，每月录入一次。")
+    st.caption("考核口径：先用实际上网电量扣除机制电量，再乘90%/110%系数。")
     row, _ = station_selector("settle_station")
     if row is None:
         st.stop()
@@ -423,10 +474,20 @@ elif page == "自动结算":
     if not sm:
         st.info("该月暂无日清分")
         st.stop()
+
     old = load_month_input(int(row.id), month)
+    me_old = max(0.0, float(old.get("mechanism_energy") or 0.0))
+    assess_base_old = max(0.0, sm["actual"] - me_old)
+    assess_cov_old = sm["lt"] / assess_base_old if assess_base_old else 0.0
+
     c = st.columns(6)
-    c[0].metric("上网电量", f"{sm['actual']:,.2f}"); c[1].metric("中长期电量", f"{sm['lt']:,.2f}"); c[2].metric("签约率", f"{sm['coverage']:.2%}")
-    c[3].metric("中长期均价", f"{sm['lt_price']:.2f}"); c[4].metric("节点现货均价", f"{sm['spot_price']:.2f}"); c[5].metric("统一结算点均价", f"{sm['unified_price']:.2f}")
+    c[0].metric("上网电量 Qactual", f"{sm['actual']:,.2f}")
+    c[1].metric("机制电量", f"{me_old:,.2f}")
+    c[2].metric("考核基准电量", f"{assess_base_old:,.2f}")
+    c[3].metric("中长期电量", f"{sm['lt']:,.2f}")
+    c[4].metric("考核签约率", f"{assess_cov_old:.2%}")
+    c[5].metric("中长期均价", f"{sm['lt_price']:.2f}")
+
     with st.expander("月度公共参数", expanded=not bool(old)):
         with st.form("market_inputs"):
             a, b, c = st.columns(3)
@@ -437,24 +498,63 @@ elif page == "自动结算":
             congestion = a.number_input("阻塞盈余返还/分摊（元）", value=float(old.get("congestion") or 0.0))
             pre_other = b.number_input("风险防范前其他费用净额（元）", value=float(old.get("pre_risk_other_fee") or 0.0))
             regular = c.number_input("风险防范后其他常规净额（元）", value=float(old.get("regular_fee") or 0.0))
+
             st.markdown("**绿电**")
             a, b, c = st.columns(3)
-            ge = a.number_input("绿电合约电量 MWh", value=float(old.get("green_contract_energy") or 0.0)); gu = b.number_input("用户实际用电量 MWh", value=float(old.get("green_user_actual_energy") or 0.0)); gp = c.number_input("绿色权益价格 元/MWh", value=float(old.get("green_environment_price") or 0.0))
+            ge = a.number_input("绿电合约电量 MWh", value=float(old.get("green_contract_energy") or 0.0))
+            gu = b.number_input("用户实际用电量 MWh", value=float(old.get("green_user_actual_energy") or 0.0))
+            gp = c.number_input("绿色权益价格 元/MWh", value=float(old.get("green_environment_price") or 0.0))
+
             st.markdown("**机制电量**")
             a, b, c = st.columns(3)
-            me = a.number_input("机制电量 MWh", value=float(old.get("mechanism_energy") or 0.0)); mp = b.number_input("机制电价 元/MWh", value=float(old.get("mechanism_price") or BASELINE_PRICE)); ms = c.number_input("机制电量对应现货均价", value=float(old.get("mechanism_spot_price") or 0.0))
+            me = a.number_input("机制电量 MWh", value=float(old.get("mechanism_energy") or 0.0), help="该电量会先从Qactual中扣除，再计算考核90%/110%边界。")
+            mp = b.number_input("机制电价 元/MWh", value=float(old.get("mechanism_price") or BASELINE_PRICE))
+            ms = c.number_input("机制电量对应现货均价", value=float(old.get("mechanism_spot_price") or 0.0))
             a, b = st.columns(2)
-            unit = a.number_input("机组/两个细则等扣费（元）", value=float(old.get("unit_fee") or 0.0)); manual = b.number_input("人工最终调整（元）", value=float(old.get("manual_adjustment") or 0.0))
+            unit = a.number_input("机组/两个细则等扣费（元）", value=float(old.get("unit_fee") or 0.0))
+            manual = b.number_input("人工最终调整（元）", value=float(old.get("manual_adjustment") or 0.0))
             if st.form_submit_button("保存月度参数并重算", type="primary"):
-                save_month_input(int(row.id), month, {"regional_same_type_lt_price": regional, "market_bilateral_listing_avg": marketavg, "curve_reasonability": curve, "congestion": congestion, "pre_risk_other_fee": pre_other, "regular_fee": regular, "green_contract_energy": ge, "green_user_actual_energy": gu, "green_environment_price": gp, "mechanism_energy": me, "mechanism_price": mp, "mechanism_spot_price": ms, "unit_fee": unit, "manual_adjustment": manual})
-                st.success("已保存")
+                save_month_input(int(row.id), month, {
+                    "regional_same_type_lt_price": regional,
+                    "market_bilateral_listing_avg": marketavg,
+                    "curve_reasonability": curve,
+                    "congestion": congestion,
+                    "pre_risk_other_fee": pre_other,
+                    "regular_fee": regular,
+                    "green_contract_energy": ge,
+                    "green_user_actual_energy": gu,
+                    "green_environment_price": gp,
+                    "mechanism_energy": me,
+                    "mechanism_price": mp,
+                    "mechanism_spot_price": ms,
+                    "unit_fee": unit,
+                    "manual_adjustment": manual,
+                })
+                st.success("已保存并按新考核口径重算")
                 st.rerun()
+
     calc = auto_settlement(sm, load_month_input(int(row.id), month))
-    c = st.columns(5)
-    c[0].metric("全月上限考核", money(calc.get("upper_assessment"))); c[1].metric("全月下限考核", money(calc.get("lower_assessment")) if calc.get("lower_ready") else "待公共参数")
-    c[2].metric("自动考核", money(calc.get("assessment"))); c[3].metric("风险防范", money(calc.get("risk_prevention")) if calc.get("risk_ready") else "待公共参数"); c[4].metric("预计最终收益", money(calc.get("final_revenue")))
+    st.subheader("考核基准")
     c = st.columns(4)
-    c[0].metric("绿电费用", money(calc.get("green_fee"))); c[1].metric("机制费用", money(calc.get("mechanism_fee"))); c[2].metric("最终结算均价", f"{calc.get('final_price', 0):.2f}"); c[3].metric("风险防范前收入", money(calc.get("pre_risk_revenue")))
+    c[0].metric("Qactual - 机制电量", f"{calc.get('assessment_actual', 0):,.2f} MWh")
+    c[1].metric("90%下限电量", f"{calc.get('assessment_lower_energy', 0):,.2f} MWh")
+    c[2].metric("110%上限电量", f"{calc.get('assessment_upper_energy', 0):,.2f} MWh")
+    c[3].metric("考核签约率", f"{calc.get('assessment_coverage', 0):.2%}")
+
+    st.subheader("自动计算结果")
+    c = st.columns(5)
+    c[0].metric("全月上限考核", money(calc.get("upper_assessment")))
+    c[1].metric("全月下限考核", money(calc.get("lower_assessment")) if calc.get("lower_ready") else "待公共参数")
+    c[2].metric("自动考核", money(calc.get("assessment")))
+    c[3].metric("风险防范", money(calc.get("risk_prevention")) if calc.get("risk_ready") else "待公共参数")
+    c[4].metric("预计最终收益", money(calc.get("final_revenue")))
+    c = st.columns(4)
+    c[0].metric("绿电费用", money(calc.get("green_fee")))
+    c[1].metric("机制费用", money(calc.get("mechanism_fee")))
+    c[2].metric("最终结算均价", f"{calc.get('final_price', 0):.2f}")
+    c[3].metric("风险防范前收入", money(calc.get("pre_risk_revenue")))
+
+    st.info("考核公式已统一为：Q考核基准 = max(Qactual - Q机制, 0)；下限 = Q考核基准×90%；上限 = Q考核基准×110%。")
 
 elif page == "交易决策":
     st.title("月内交易决策")
@@ -463,20 +563,44 @@ elif page == "交易决策":
         st.stop()
     month = st.text_input("月份 YYYY-MM", date.today().strftime("%Y-%m"), key="decision_month")
     sm = month_summary(month_daily(int(row.id), month)) or {"actual": 0, "lt": 0, "coverage": 0, "lt_price": 0, "spot_price": 0}
-    st.caption(f"截至已上传日清分：已发 {sm['actual']:.2f} MWh｜已签 {sm['lt']:.2f} MWh｜当前覆盖率 {sm['coverage']:.2%}")
+    old = load_month_input(int(row.id), month)
+    me_done = max(0.0, float(old.get("mechanism_energy") or 0.0))
+    assess_actual_done = max(0.0, sm["actual"] - me_done)
+    assess_cov_done = sm["lt"] / assess_actual_done if assess_actual_done else 0.0
+    st.caption(f"截至已上传日清分：已发 {sm['actual']:.2f} MWh｜机制电量 {me_done:.2f} MWh｜考核基准 {assess_actual_done:.2f} MWh｜已签 {sm['lt']:.2f} MWh｜考核覆盖率 {assess_cov_done:.2%}")
+
     a, b, c = st.columns(3)
-    p10 = a.number_input("剩余P10低发预测 MWh", 0.0); p50 = b.number_input("剩余P50预测 MWh", 0.0); p90 = c.number_input("剩余P90高发预测 MWh", 0.0)
+    p10 = a.number_input("剩余P10低发预测 MWh", 0.0)
+    p50 = b.number_input("剩余P50预测 MWh", 0.0)
+    p90 = c.number_input("剩余P90高发预测 MWh", 0.0)
     a, b, c, d = st.columns(4)
-    remain_lt = a.number_input("剩余已签中长期 MWh", 0.0); expected_spot = b.number_input("预计剩余现货均价", value=float(sm['spot_price'])); trade_price = c.number_input("当前拟交易价格", value=float(sm['lt_price'])); proposed = d.number_input("试算交易量（卖出正/买回负）", value=0.0)
-    risk_upper = float(row.get("risk_upper") or 1.10); total_lt = sm['lt'] + remain_lt + proposed
+    remain_lt = a.number_input("剩余已签中长期 MWh", 0.0)
+    expected_spot = b.number_input("预计剩余现货均价", value=float(sm['spot_price']))
+    trade_price = c.number_input("当前拟交易价格", value=float(sm['lt_price']))
+    proposed = d.number_input("试算交易量（卖出正/买回负）", value=0.0)
+
+    risk_upper = float(row.get("risk_upper") or 1.10)
+    total_lt = sm['lt'] + remain_lt + proposed
     rows = []
     for name, rem in [("P10", p10), ("P50", p50), ("P90", p90)]:
-        total = sm['actual'] + rem; cov = total_lt / total if total else 0; space = total * risk_upper - total_lt
-        rows.append([name, total, total_lt, cov, space])
-    x = pd.DataFrame(rows, columns=["情景", "预计月底总电量", "交易后总合同", "仓位", "距风险上限空间"])
+        total_actual = sm['actual'] + rem
+        assess_total = max(0.0, total_actual - me_done)
+        cov = total_lt / assess_total if assess_total else 0.0
+        space = assess_total * risk_upper - total_lt
+        rows.append([name, total_actual, assess_total, total_lt, cov, space])
+    x = pd.DataFrame(rows, columns=["情景", "预计月底总上网", "扣机制后考核电量", "交易后总合同", "考核仓位", "距风险上限空间"])
     st.dataframe(x, use_container_width=True, hide_index=True)
-    spread = trade_price - expected_spot; p10space = float(x.iloc[0]["距风险上限空间"]); limit = float(row.get("trade_limit_mwh") or 100); threshold = float(row.get("min_spread") or 10)
-    suggestion = f"优先买回/降仓，至少 {-p10space:.2f} MWh" if p10space < 0 else (f"可考虑卖出，单次建议不超过 {min(p10space, limit):.2f} MWh" if spread >= threshold else "观望/保留现货")
+
+    spread = trade_price - expected_spot
+    p10space = float(x.iloc[0]["距风险上限空间"])
+    limit = float(row.get("trade_limit_mwh") or 100)
+    threshold = float(row.get("min_spread") or 10)
+    if p10space < 0:
+        suggestion = f"优先买回/降仓，至少 {-p10space:.2f} MWh"
+    elif spread >= threshold:
+        suggestion = f"可考虑卖出，单次建议不超过 {min(p10space, limit):.2f} MWh"
+    else:
+        suggestion = "观望/保留现货"
     st.metric("中长期-预计现货价差", f"{spread:.2f} 元/MWh")
     st.success(suggestion)
 
@@ -502,6 +626,7 @@ elif page == "系统状态":
     if DB_OK:
         st.success("Supabase 数据库已连接")
         st.write("规则版本：", RULE_VERSION)
+        st.write("考核口径：Qactual - 机制电量 后再乘90%/110%")
         st.write("核心表：stations / daily_summary / hourly_detail / monthly_settlement")
     else:
         st.error(DB_ERROR)
