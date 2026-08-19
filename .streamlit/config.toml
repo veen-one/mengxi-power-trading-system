@@ -1,2 +1,5 @@
 [runner]
 magicEnabled = false
+
+[client]
+showSidebarNavigation = true
