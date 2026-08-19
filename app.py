@@ -15,7 +15,7 @@ from supabase_backend import (
 
 APP_TITLE = "蒙西新能源多场站日清分与交易决策系统"
 st.set_page_config(page_title=APP_TITLE, page_icon="⚡", layout="wide")
-RULE_VERSION = "蒙西2026（自动结算V2.7）"
+RULE_VERSION = "蒙西2026（自动结算V2.8）"
 BASELINE_PRICE = 282.9
 MONTH_LOWER = 0.90
 MONTH_UPPER = 1.10
@@ -244,7 +244,7 @@ except Exception as e:
     DB_OK, DB_ERROR = False, str(e)
 
 st.sidebar.title("⚡ 蒙西交易系统")
-st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.7")
+st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.8")
 if DB_OK:
     st.sidebar.success("数据库已连接")
 else:
@@ -332,7 +332,7 @@ elif page == "月度累计":
 
 elif page == "价格曲线":
     st.title("📈 时点价格曲线与价差分析")
-    st.caption("按已入库日清分，从当月1日累计到所选截止日期，查看中长期合约价、实时节点电价、全网统一价及中长期-全网统一价差。")
+    st.caption("按已入库日清分，从当月1日累计到所选截止日期；横轴按每天24个时点划分。")
 
     r = selector("price_curve_station")
     if r is None:
@@ -358,16 +358,12 @@ elif page == "价格曲线":
 
     c1, c2, c3 = st.columns(3)
     cutoff = c1.selectbox(
-        "截止日期",
-        available_dates,
-        index=len(available_dates) - 1,
-        format_func=lambda x: x.strftime("%Y-%m-%d"),
-        key="price_curve_cutoff",
+        "截止日期", available_dates, index=len(available_dates) - 1,
+        format_func=lambda x: x.strftime("%Y-%m-%d"), key="price_curve_cutoff",
     )
     smooth_hours = c2.slider(
-        "平滑窗口（小时）", 1, 12, 3, 1,
-        help="1=原始24时点；数值越大曲线越平滑。",
-        key="price_curve_smooth",
+        "平滑窗口（时点）", 1, 12, 3, 1,
+        help="1=原始24时点；数值越大曲线越平滑。", key="price_curve_smooth",
     )
     show_raw = c3.checkbox("显示原始时点数据", value=False, key="price_curve_show_raw")
 
@@ -382,27 +378,43 @@ elif page == "价格曲线":
         hourly[col] = pd.to_numeric(hourly[col], errors="coerce")
     hourly["trade_date"] = pd.to_datetime(hourly["trade_date"], errors="coerce")
     hourly = hourly.dropna(subset=["trade_date", "hour_no"]).copy()
-    hourly["时间"] = hourly["trade_date"] + pd.to_timedelta(hourly["hour_no"] - 1, unit="h")
-    hourly = hourly.sort_values("时间").drop_duplicates(subset=["时间"], keep="last")
+    hourly["hour_no"] = hourly["hour_no"].astype(int)
+    hourly = hourly.sort_values(["trade_date", "hour_no"]).drop_duplicates(
+        subset=["trade_date", "hour_no"], keep="last"
+    )
 
+    hourly["日期"] = hourly["trade_date"].dt.strftime("%m-%d")
+    hourly["日期时点"] = hourly["日期"] + " / " + hourly["hour_no"].map(lambda x: f"{x:02d}时")
     hourly["中长期合约价"] = hourly["lt_price"]
     hourly["实时节点电价"] = hourly["spot_price"]
     hourly["全网统一价"] = hourly["unified_price"]
     hourly["中长期-全网统一价差"] = hourly["lt_price"] - hourly["unified_price"]
 
     price_cols = ["中长期合约价", "实时节点电价", "全网统一价"]
-    price_plot = hourly.set_index("时间")[price_cols].copy()
-    spread_plot = hourly.set_index("时间")[["中长期-全网统一价差"]].copy()
+    plot_base = hourly[["日期时点"] + price_cols + ["中长期-全网统一价差"]].copy()
+    for col in price_cols + ["中长期-全网统一价差"]:
+        plot_base[col] = pd.to_numeric(plot_base[col], errors="coerce")
+        if smooth_hours > 1:
+            plot_base[col] = plot_base[col].rolling(
+                window=smooth_hours, min_periods=1, center=True
+            ).mean()
 
-    if smooth_hours > 1:
-        price_plot = price_plot.rolling(window=smooth_hours, min_periods=1, center=True).mean()
-        spread_plot = spread_plot.rolling(window=smooth_hours, min_periods=1, center=True).mean()
+    price_plot = plot_base.set_index("日期时点")[price_cols]
+    spread_plot = plot_base.set_index("日期时点")[["中长期-全网统一价差"]]
 
     st.subheader(f"{r['name']}｜{month}-01 至 {end_date}｜三类价格平滑曲线")
+    st.caption("横轴格式：日期 / 时点。每一天按01时→24时排列，再进入下一天。")
     st.line_chart(price_plot, use_container_width=True, height=430)
 
     st.subheader("中长期合约价 - 全网统一价｜价差平滑曲线")
     st.line_chart(spread_plot, use_container_width=True, height=320)
+
+    day_axis = hourly.groupby("日期")["hour_no"].agg(["min", "max", "count"]).reset_index()
+    day_axis["横轴区间"] = day_axis.apply(
+        lambda x: f"{x['日期']}：{int(x['min']):02d}时—{int(x['max']):02d}时（{int(x['count'])}个时点）",
+        axis=1,
+    )
+    st.caption("｜".join(day_axis["横轴区间"].tolist()))
 
     spread_raw = hourly["中长期-全网统一价差"].dropna()
     if not spread_raw.empty:
@@ -415,8 +427,9 @@ elif page == "价格曲线":
     st.caption("实时节点电价=日清分 spot_price；全网统一价=unified_price；价差=P_LT-P_全网统一。平滑仅影响图形展示，不改变数据库原始值。")
 
     if show_raw:
-        raw = hourly[["时间", "中长期合约价", "实时节点电价", "全网统一价", "中长期-全网统一价差"]].copy()
-        for col in raw.columns[1:]:
+        raw = hourly[["日期", "hour_no", "中长期合约价", "实时节点电价", "全网统一价", "中长期-全网统一价差"]].copy()
+        raw = raw.rename(columns={"hour_no": "时点"})
+        for col in raw.columns[2:]:
             raw[col] = pd.to_numeric(raw[col], errors="coerce").round(4)
         st.subheader("原始24时点价格数据")
         st.dataframe(raw, use_container_width=True, hide_index=True, height=520)
@@ -631,5 +644,5 @@ elif page == "系统状态":
         st.error(DB_ERROR)
     st.write("规则版本：", RULE_VERSION)
     st.write("绿电：Q绿电合约=中长期合约电量QLT；Q绿电=min(QLT,Qactual-Q机制)")
-    st.write("价格曲线：按已入库日期×24时点绘制P_LT、实时节点电价、全网统一价及P_LT-P统一价差")
+    st.write("价格曲线：横轴按每天01—24时点分组，绘制P_LT、实时节点电价、全网统一价及P_LT-P统一价差")
     st.write("交易决策：P10/P50/P90月底仓位 + 90%/110%考核边界 + 安全缓冲 + 价差决策")
