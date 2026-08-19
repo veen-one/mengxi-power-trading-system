@@ -108,6 +108,23 @@ def hourly_rows(station_id: int, trade_date: str):
     return pd.DataFrame(data)
 
 
+def hourly_range(station_id: int, start_date: str, end_date: str):
+    data = (
+        get_supabase()
+        .table("hourly_detail")
+        .select("trade_date,hour_no,lt_energy,lt_price,actual_energy,spot_price,unified_price")
+        .eq("station_id", station_id)
+        .gte("trade_date", start_date)
+        .lte("trade_date", end_date)
+        .order("trade_date")
+        .order("hour_no")
+        .execute()
+        .data
+        or []
+    )
+    return pd.DataFrame(data)
+
+
 def save_daily(station_id: int, filename: str, file_hash: str, summary: dict, hourly: pd.DataFrame, overwrite=False):
     sb = get_supabase()
     trade_date = summary["trade_date"].isoformat() if hasattr(summary["trade_date"], "isoformat") else str(summary["trade_date"])
