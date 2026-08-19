@@ -10,12 +10,12 @@ from openpyxl import load_workbook
 
 from supabase_backend import (
     all_daily, create_station, daily_rows, delete_daily, get_supabase, healthcheck,
-    hourly_rows, month_daily, save_daily, stations, update_station,
+    hourly_range, hourly_rows, month_daily, save_daily, stations, update_station,
 )
 
 APP_TITLE = "蒙西新能源多场站日清分与交易决策系统"
 st.set_page_config(page_title=APP_TITLE, page_icon="⚡", layout="wide")
-RULE_VERSION = "蒙西2026（自动结算V2.6）"
+RULE_VERSION = "蒙西2026（自动结算V2.7）"
 BASELINE_PRICE = 282.9
 MONTH_LOWER = 0.90
 MONTH_UPPER = 1.10
@@ -244,13 +244,16 @@ except Exception as e:
     DB_OK, DB_ERROR = False, str(e)
 
 st.sidebar.title("⚡ 蒙西交易系统")
-st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.6")
+st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.7")
 if DB_OK:
     st.sidebar.success("数据库已连接")
 else:
     st.sidebar.error("数据库未连接")
 
-page = st.sidebar.radio("导航", ["总览", "场站管理", "日清分上传", "月度累计", "自动结算", "交易决策", "数据管理", "系统状态"])
+page = st.sidebar.radio(
+    "导航",
+    ["总览", "场站管理", "日清分上传", "月度累计", "价格曲线", "自动结算", "交易决策", "数据管理", "系统状态"],
+)
 if not DB_OK and page != "系统状态":
     st.error(DB_ERROR)
     st.stop()
@@ -281,6 +284,9 @@ elif page == "场站管理":
 elif page == "日清分上传":
     st.title("日清分批量上传")
     sdf = stations()
+    if sdf.empty:
+        st.warning("请先创建场站")
+        st.stop()
     names = sdf.name.tolist()
     ids = dict(zip(sdf.name, sdf.id))
     files = st.file_uploader("选择多个Excel", type=["xlsx", "xlsm"], accept_multiple_files=True)
@@ -311,7 +317,7 @@ elif page == "日清分上传":
 elif page == "月度累计":
     st.title("月度累计")
     r = selector("m")
-    month = st.text_input("月份 YYYY-MM", date.today().strftime("%Y-%m"))
+    month = st.text_input("月份 YYYY-MM", date.today().strftime("%Y-%m"), key="month_summary_month")
     if r is not None:
         df = month_daily(int(r.id), month)
         sm = month_summary(df)
@@ -321,6 +327,99 @@ elif page == "月度累计":
                 ["现货均价", sm["spot_price"]], ["电能量收入", sm["energy"]],
             ], columns=["项目", "结果"]), use_container_width=True, hide_index=True)
             st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("该月暂无数据")
+
+elif page == "价格曲线":
+    st.title("📈 时点价格曲线与价差分析")
+    st.caption("按已入库日清分，从当月1日累计到所选截止日期，查看中长期合约价、实时节点电价、全网统一价及中长期-全网统一价差。")
+
+    r = selector("price_curve_station")
+    if r is None:
+        st.stop()
+    month = st.text_input("月份 YYYY-MM", date.today().strftime("%Y-%m"), key="price_curve_month")
+
+    try:
+        daily = month_daily(int(r.id), month)
+    except Exception as exc:
+        st.error(f"月份格式或数据读取失败：{exc}")
+        st.stop()
+
+    if daily.empty:
+        st.info("该场站该月暂无已入库日清分。")
+        st.stop()
+
+    available_dates = sorted(
+        pd.to_datetime(daily["trade_date"], errors="coerce").dropna().dt.date.unique().tolist()
+    )
+    if not available_dates:
+        st.info("未找到有效交易日期。")
+        st.stop()
+
+    c1, c2, c3 = st.columns(3)
+    cutoff = c1.selectbox(
+        "截止日期",
+        available_dates,
+        index=len(available_dates) - 1,
+        format_func=lambda x: x.strftime("%Y-%m-%d"),
+        key="price_curve_cutoff",
+    )
+    smooth_hours = c2.slider(
+        "平滑窗口（小时）", 1, 12, 3, 1,
+        help="1=原始24时点；数值越大曲线越平滑。",
+        key="price_curve_smooth",
+    )
+    show_raw = c3.checkbox("显示原始时点数据", value=False, key="price_curve_show_raw")
+
+    start_date = f"{month}-01"
+    end_date = cutoff.isoformat()
+    hourly = hourly_range(int(r.id), start_date, end_date)
+    if hourly.empty:
+        st.info("该范围暂无24时点明细。")
+        st.stop()
+
+    for col in ["hour_no", "lt_price", "spot_price", "unified_price"]:
+        hourly[col] = pd.to_numeric(hourly[col], errors="coerce")
+    hourly["trade_date"] = pd.to_datetime(hourly["trade_date"], errors="coerce")
+    hourly = hourly.dropna(subset=["trade_date", "hour_no"]).copy()
+    hourly["时间"] = hourly["trade_date"] + pd.to_timedelta(hourly["hour_no"] - 1, unit="h")
+    hourly = hourly.sort_values("时间").drop_duplicates(subset=["时间"], keep="last")
+
+    hourly["中长期合约价"] = hourly["lt_price"]
+    hourly["实时节点电价"] = hourly["spot_price"]
+    hourly["全网统一价"] = hourly["unified_price"]
+    hourly["中长期-全网统一价差"] = hourly["lt_price"] - hourly["unified_price"]
+
+    price_cols = ["中长期合约价", "实时节点电价", "全网统一价"]
+    price_plot = hourly.set_index("时间")[price_cols].copy()
+    spread_plot = hourly.set_index("时间")[["中长期-全网统一价差"]].copy()
+
+    if smooth_hours > 1:
+        price_plot = price_plot.rolling(window=smooth_hours, min_periods=1, center=True).mean()
+        spread_plot = spread_plot.rolling(window=smooth_hours, min_periods=1, center=True).mean()
+
+    st.subheader(f"{r['name']}｜{month}-01 至 {end_date}｜三类价格平滑曲线")
+    st.line_chart(price_plot, use_container_width=True, height=430)
+
+    st.subheader("中长期合约价 - 全网统一价｜价差平滑曲线")
+    st.line_chart(spread_plot, use_container_width=True, height=320)
+
+    spread_raw = hourly["中长期-全网统一价差"].dropna()
+    if not spread_raw.empty:
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("截止时点价差", f"{spread_raw.iloc[-1]:.2f} 元/MWh")
+        m2.metric("累计平均价差", f"{spread_raw.mean():.2f} 元/MWh")
+        m3.metric("最大正价差", f"{spread_raw.max():.2f} 元/MWh")
+        m4.metric("最大负价差", f"{spread_raw.min():.2f} 元/MWh")
+
+    st.caption("实时节点电价=日清分 spot_price；全网统一价=unified_price；价差=P_LT-P_全网统一。平滑仅影响图形展示，不改变数据库原始值。")
+
+    if show_raw:
+        raw = hourly[["时间", "中长期合约价", "实时节点电价", "全网统一价", "中长期-全网统一价差"]].copy()
+        for col in raw.columns[1:]:
+            raw[col] = pd.to_numeric(raw[col], errors="coerce").round(4)
+        st.subheader("原始24时点价格数据")
+        st.dataframe(raw, use_container_width=True, hide_index=True, height=520)
 
 elif page == "自动结算":
     st.title("自动结算｜月度结算表")
@@ -465,7 +564,6 @@ elif page == "交易决策":
     st.subheader("决策建议")
     p10_row = scenario_df.iloc[0]
     p50_row = scenario_df.iloc[1]
-    p90_row = scenario_df.iloc[2]
     spread = trade_price - expected_spot
     min_spread = float(r.get("min_spread") or 10.0)
     single_limit = float(r.get("trade_limit_mwh") or 100.0)
@@ -533,4 +631,5 @@ elif page == "系统状态":
         st.error(DB_ERROR)
     st.write("规则版本：", RULE_VERSION)
     st.write("绿电：Q绿电合约=中长期合约电量QLT；Q绿电=min(QLT,Qactual-Q机制)")
+    st.write("价格曲线：按已入库日期×24时点绘制P_LT、实时节点电价、全网统一价及P_LT-P统一价差")
     st.write("交易决策：P10/P50/P90月底仓位 + 90%/110%考核边界 + 安全缓冲 + 价差决策")
