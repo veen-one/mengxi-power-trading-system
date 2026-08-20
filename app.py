@@ -2,11 +2,11 @@ from pathlib import Path
 
 src = Path(__file__).with_name("app_base.py").read_text(encoding="utf-8")
 
-def repl(old: str, new: str):
+def repl(old: str, new: str, count=None):
     global src
     if old not in src:
         raise RuntimeError(f"V3.0 patch target not found: {old[:80]}")
-    src = src.replace(old, new)
+    src = src.replace(old, new) if count is None else src.replace(old, new, count)
 
 repl('RULE_VERSION = "蒙西2026（自动结算V2.9）"', 'RULE_VERSION = "蒙西2026（自动结算V3.0）"')
 repl('st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.9")', 'st.sidebar.caption("Supabase 云数据库版 · 自动结算V3.0")')
@@ -21,7 +21,7 @@ repl('''                        "green_environment_price": gp, "mechanism_energy
 
 repl('''            ["机制", "机制费用", "Q机制×(P机制-P机制现货)", calc["mechanism_fee"], "元"],\n            ["结果", "预计最终收益", "自动汇总", calc["final_revenue"], "元"],\n            ["结果", "最终结算均价", "最终收益/Qactual", calc["final_price"], "元/MWh"],''', '''            ["机制", "机制费用", "手工填写", calc["mechanism_fee"], "元"],\n            ["置换", "置换费用", "手工填写", calc["replacement_fee"], "元"],\n            ["结果", "结算口径收入", "不含阻塞盈余，含置换费用", calc["settlement_revenue"], "元"],\n            ["结果", "含阻塞总收益", "结算口径收入+阻塞盈余", calc["final_revenue"], "元"],\n            ["结果", "最终结算均价", "结算口径收入/Qactual（不含阻塞、含置换）", calc["final_price"], "元/MWh"],''')
 
-repl('''    inp = load_input(int(r.id), month)\n    calc = auto_settlement(sm, inp)''', '''    inp = load_input(int(r.id), month)\n    with st.expander("费用手工录入｜机制费用 / 置换费用", expanded=False):\n        with st.form("station_statement_manual_fees"):\n            fa, fb, fc = st.columns(3)\n            fee_me = fa.number_input("机制电量 MWh", value=float(inp.get("mechanism_energy") or 0), key="report_me")\n            fee_mech = fb.number_input("机制费用（手工填写） 元", value=float(inp.get("mechanism_fee_manual") or 0), key="report_mech_fee")\n            fee_replace = fc.number_input("置换费用（手工填写） 元", value=float(inp.get("replacement_fee") or 0), key="report_replace_fee")\n            if st.form_submit_button("保存费用并重算", type="primary"):\n                save_input(int(r.id), month, {\n                    "mechanism_energy": fee_me,\n                    "mechanism_fee_manual": fee_mech,\n                    "replacement_fee": fee_replace,\n                })\n                st.rerun()\n    inp = load_input(int(r.id), month)\n    calc = auto_settlement(sm, inp)''')
+repl('''    inp = load_input(int(r.id), month)\n    calc = auto_settlement(sm, inp)''', '''    inp = load_input(int(r.id), month)\n    with st.expander("费用手工录入｜机制费用 / 置换费用", expanded=False):\n        with st.form("station_statement_manual_fees"):\n            fa, fb, fc = st.columns(3)\n            fee_me = fa.number_input("机制电量 MWh", value=float(inp.get("mechanism_energy") or 0), key="report_me")\n            fee_mech = fb.number_input("机制费用（手工填写） 元", value=float(inp.get("mechanism_fee_manual") or 0), key="report_mech_fee")\n            fee_replace = fc.number_input("置换费用（手工填写） 元", value=float(inp.get("replacement_fee") or 0), key="report_replace_fee")\n            if st.form_submit_button("保存费用并重算", type="primary"):\n                save_input(int(r.id), month, {\n                    "mechanism_energy": fee_me,\n                    "mechanism_fee_manual": fee_mech,\n                    "replacement_fee": fee_replace,\n                })\n                st.rerun()\n    inp = load_input(int(r.id), month)\n    calc = auto_settlement(sm, inp)''', count=1)
 
 repl('''            ["阻塞盈余", float(inp.get("congestion") or 0.0), "元"],\n            ["风险防范", calc["risk_prevention"], "元"],\n            ["绿电费用", calc["green_fee"], "元"],\n            ["机制费用", calc["mechanism_fee"], "元"],\n            ["机组/两个细则扣费", -float(inp.get("unit_fee") or 0.0), "元"],\n            ["预计最终收益", calc["final_revenue"], "元"],\n            ["最终结算均价", calc["final_price"], "元/MWh"],''', '''            ["阻塞盈余（不计入最终均价）", float(inp.get("congestion") or 0.0), "元"],\n            ["风险防范", calc["risk_prevention"], "元"],\n            ["绿电费用", calc["green_fee"], "元"],\n            ["机制费用（手工）", calc["mechanism_fee"], "元"],\n            ["置换费用（手工）", calc["replacement_fee"], "元"],\n            ["机组/两个细则扣费", -float(inp.get("unit_fee") or 0.0), "元"],\n            ["结算口径收入（不含阻塞）", calc["settlement_revenue"], "元"],\n            ["含阻塞总收益", calc["final_revenue"], "元"],\n            ["最终结算均价", calc["final_price"], "元/MWh"],''')
 
