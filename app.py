@@ -1,3 +1,4 @@
+import calendar
 import hashlib
 import re
 from datetime import date, datetime
@@ -15,7 +16,7 @@ from supabase_backend import (
 
 APP_TITLE = "蒙西新能源多场站日清分与交易决策系统"
 st.set_page_config(page_title=APP_TITLE, page_icon="⚡", layout="wide")
-RULE_VERSION = "蒙西2026（自动结算V2.8）"
+RULE_VERSION = "蒙西2026（自动结算V2.9）"
 BASELINE_PRICE = 282.9
 MONTH_LOWER = 0.90
 MONTH_UPPER = 1.10
@@ -244,7 +245,7 @@ except Exception as e:
     DB_OK, DB_ERROR = False, str(e)
 
 st.sidebar.title("⚡ 蒙西交易系统")
-st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.8")
+st.sidebar.caption("Supabase 云数据库版 · 自动结算V2.9")
 if DB_OK:
     st.sidebar.success("数据库已连接")
 else:
@@ -252,7 +253,7 @@ else:
 
 page = st.sidebar.radio(
     "导航",
-    ["总览", "场站管理", "日清分上传", "月度累计", "价格曲线", "自动结算", "交易决策", "数据管理", "系统状态"],
+    ["总览", "场站管理", "日清分上传", "月度累计", "场站月报", "价格曲线", "自动结算", "交易决策", "数据管理", "系统状态"],
 )
 if not DB_OK and page != "系统状态":
     st.error(DB_ERROR)
@@ -330,6 +331,112 @@ elif page == "月度累计":
         else:
             st.info("该月暂无数据")
 
+elif page == "场站月报":
+    st.title("📋 场站月度清分汇总")
+    st.caption("按场站、月份生成与日常Excel接近的整月清分表；未入库日期自动补0，月底汇总和结算项自动计算。")
+    r = selector("station_statement_station")
+    if r is None:
+        st.stop()
+    month = st.text_input("月份 YYYY-MM", date.today().strftime("%Y-%m"), key="station_statement_month")
+    try:
+        y, m = map(int, month.split("-"))
+        days = calendar.monthrange(y, m)[1]
+        df = month_daily(int(r.id), month)
+    except Exception as exc:
+        st.error(f"月份格式或数据读取失败：{exc}")
+        st.stop()
+
+    cols = ["lt_energy", "lt_price", "actual_energy", "spot_price", "spot_fee", "lt_diff_fee", "energy_total"]
+    if df.empty:
+        df = pd.DataFrame(columns=["trade_date"] + cols)
+    for c in cols:
+        if c not in df.columns:
+            df[c] = 0.0
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    if "trade_date" not in df.columns:
+        df["trade_date"] = pd.Series(dtype=str)
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce")
+    daily_map = {x.trade_date.date(): x for _, x in df.dropna(subset=["trade_date"]).iterrows()}
+
+    statement_rows = []
+    for d in range(1, days + 1):
+        dt = date(y, m, d)
+        x = daily_map.get(dt)
+        if x is None:
+            values = [0.0] * 7
+        else:
+            values = [float(x.get(c, 0.0) or 0.0) for c in cols]
+        day_code = m * 1000 + d
+        statement_rows.append([day_code] + values)
+
+    statement = pd.DataFrame(statement_rows, columns=[
+        "日期", "合约电量", "合约均价", "上网电量", "日现货均价", "现货全电费", "中长期差价电费", "电能电费"
+    ])
+    lt_total = float(statement["合约电量"].sum())
+    actual_total = float(statement["上网电量"].sum())
+    lt_avg = wavg(statement["合约均价"], statement["合约电量"])
+    spot_avg = wavg(statement["日现货均价"], statement["上网电量"])
+    spot_fee_total = float(statement["现货全电费"].sum())
+    lt_diff_total = float(statement["中长期差价电费"].sum())
+    energy_total = float(statement["电能电费"].sum())
+    total_row = pd.DataFrame([[
+        "合计", lt_total, lt_avg, actual_total, spot_avg, spot_fee_total, lt_diff_total, energy_total
+    ]], columns=statement.columns)
+    statement_show = pd.concat([statement, total_row], ignore_index=True)
+
+    st.subheader(f"{r['name']}｜{month} 月度日清分")
+    numeric_cols = [c for c in statement_show.columns if c != "日期"]
+    for c in numeric_cols:
+        statement_show[c] = pd.to_numeric(statement_show[c], errors="coerce").fillna(0.0).round(4)
+    st.dataframe(statement_show, use_container_width=True, hide_index=True, height=760)
+
+    sm = {
+        "lt": lt_total,
+        "actual": actual_total,
+        "coverage": lt_total / actual_total if actual_total else 0.0,
+        "lt_price": lt_avg,
+        "spot_price": spot_avg,
+        "unified_price": wavg(df.get("unified_price", pd.Series(dtype=float)), df.get("lt_energy", pd.Series(dtype=float))) if not df.empty else 0.0,
+        "energy": energy_total,
+    }
+    inp = load_input(int(r.id), month)
+    calc = auto_settlement(sm, inp)
+    mechanism_energy = max(0.0, float(inp.get("mechanism_energy") or 0.0))
+    lower_shortage = max(0.0, calc["assessment_lower_energy"] - lt_total)
+    upper_excess = max(0.0, lt_total - calc["assessment_upper_energy"])
+    energy_avg = energy_total / actual_total if actual_total else 0.0
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("电量与考核")
+        quantity_summary = pd.DataFrame([
+            ["机制电量", mechanism_energy, "MWh"],
+            ["扣机制后考核基准", calc["assessment_actual"], "MWh"],
+            ["考核-下限缺口", lower_shortage, "MWh"],
+            ["考核-上限超额", upper_excess, "MWh"],
+            ["考核签约率", calc["assessment_coverage"] * 100, "%"],
+            ["绿电结算电量", calc["green_energy"], "MWh"],
+        ], columns=["项目", "数值", "单位"])
+        quantity_summary["数值"] = pd.to_numeric(quantity_summary["数值"], errors="coerce").round(4)
+        st.dataframe(quantity_summary, use_container_width=True, hide_index=True)
+    with c2:
+        st.subheader("费用与均价")
+        fee_summary = pd.DataFrame([
+            ["电能均价", energy_avg, "元/MWh"],
+            ["考核费用", -calc["assessment"], "元"],
+            ["阻塞盈余", float(inp.get("congestion") or 0.0), "元"],
+            ["风险防范", calc["risk_prevention"], "元"],
+            ["绿电费用", calc["green_fee"], "元"],
+            ["机制费用", calc["mechanism_fee"], "元"],
+            ["机组/两个细则扣费", -float(inp.get("unit_fee") or 0.0), "元"],
+            ["预计最终收益", calc["final_revenue"], "元"],
+            ["最终结算均价", calc["final_price"], "元/MWh"],
+        ], columns=["项目", "数值", "单位"])
+        fee_summary["数值"] = pd.to_numeric(fee_summary["数值"], errors="coerce").round(4)
+        st.dataframe(fee_summary, use_container_width=True, hide_index=True)
+
+    st.caption("日表口径：现货全电费=上网电量×日现货均价；中长期差价电费来自日清分；电能电费=现货全电费+中长期差价电费。考核基准=Qactual-Q机制，90%/110%边界沿用自动结算口径。")
+
 elif page == "价格曲线":
     st.title("📈 时点价格曲线与价差分析")
     st.caption("按已入库日清分，从当月1日累计到所选截止日期；横轴按每天24个时点划分。")
@@ -395,9 +502,7 @@ elif page == "价格曲线":
     for col in price_cols + ["中长期-全网统一价差"]:
         plot_base[col] = pd.to_numeric(plot_base[col], errors="coerce")
         if smooth_hours > 1:
-            plot_base[col] = plot_base[col].rolling(
-                window=smooth_hours, min_periods=1, center=True
-            ).mean()
+            plot_base[col] = plot_base[col].rolling(window=smooth_hours, min_periods=1, center=True).mean()
 
     price_plot = plot_base.set_index("日期时点")[price_cols]
     spread_plot = plot_base.set_index("日期时点")[["中长期-全网统一价差"]]
@@ -411,8 +516,7 @@ elif page == "价格曲线":
 
     day_axis = hourly.groupby("日期")["hour_no"].agg(["min", "max", "count"]).reset_index()
     day_axis["横轴区间"] = day_axis.apply(
-        lambda x: f"{x['日期']}：{int(x['min']):02d}时—{int(x['max']):02d}时（{int(x['count'])}个时点）",
-        axis=1,
+        lambda x: f"{x['日期']}：{int(x['min']):02d}时—{int(x['max']):02d}时（{int(x['count'])}个时点）", axis=1,
     )
     st.caption("｜".join(day_axis["横轴区间"].tolist()))
 
@@ -644,5 +748,6 @@ elif page == "系统状态":
         st.error(DB_ERROR)
     st.write("规则版本：", RULE_VERSION)
     st.write("绿电：Q绿电合约=中长期合约电量QLT；Q绿电=min(QLT,Qactual-Q机制)")
+    st.write("场站月报：按整月日期展示合约电量/均价、上网电量、日现货均价、现货电费、中长期差价电费、电能电费，并自动汇总结算项")
     st.write("价格曲线：横轴按每天01—24时点分组，绘制P_LT、实时节点电价、全网统一价及P_LT-P统一价差")
     st.write("交易决策：P10/P50/P90月底仓位 + 90%/110%考核边界 + 安全缓冲 + 价差决策")
